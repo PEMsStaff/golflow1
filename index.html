@@ -127,12 +127,28 @@
   ];
 
   function toast(msg){$('#toast').textContent=msg;$('#toast').classList.add('show');setTimeout(()=>$('#toast').classList.remove('show'),2200)}
-  function isGlobal(){return profile?.role === 'Administrador Global'}
-  function can(permission){ if(isGlobal()) return true; const r = roles.find(x=>x.name===profile?.role); return r?.permissions?.includes(permission) || false; }
-  function visibleUsers(){return users.filter(u=> isGlobal() ? true : (u.role !== 'Administrador Global' && u.courseId === profile?.courseId));}
-  function canEditTargetUser(u){ if(!u)return false; if(!can('users.edit'))return false; if(isGlobal())return true; if(u.role==='Administrador Global')return false; return u.courseId===profile?.courseId; }
+  function normRole(role){
+    const r = (role || '').trim();
+    const map = {
+      'Administrador del Campo':'Administrador de Campo',
+      'Admin Campo':'Administrador de Campo',
+      'Admin de Campo':'Administrador de Campo',
+      'Administrador Global ':'Administrador Global'
+    };
+    return map[r] || r;
+  }
+  function isGlobal(){return normRole(profile?.role) === 'Administrador Global'}
+  function can(permission){
+    if(isGlobal()) return true;
+    const myRole = normRole(profile?.role);
+    const sourceRoles = roles.length ? roles : defaultRoles;
+    const r = sourceRoles.find(x=>normRole(x.name)===myRole);
+    return r?.permissions?.includes(permission) || false;
+  }
+  function visibleUsers(){return users.filter(u=> isGlobal() ? true : (normRole(u.role) !== 'Administrador Global' && u.courseId === profile?.courseId));}
+  function canEditTargetUser(u){ if(!u)return false; if(!can('users.edit'))return false; if(isGlobal())return true; if(normRole(u.role)==='Administrador Global')return false; return u.courseId===profile?.courseId; }
   function canResetTargetUser(u){ return canEditTargetUser(u); }
-  function canDeleteTargetUser(u){ if(!u)return false; if(!can('users.delete'))return false; if(u.id===profile?.id)return false; if(isGlobal())return true; if(u.role==='Administrador Global')return false; if(u.role==='Administrador del Campo')return false; return u.courseId===profile?.courseId; }
+  function canDeleteTargetUser(u){ if(!u)return false; if(!can('users.delete'))return false; if(u.id===profile?.id)return false; if(isGlobal())return true; if(normRole(u.role)==='Administrador Global')return false; if(normRole(u.role)==='Administrador de Campo')return false; return u.courseId===profile?.courseId; }
   function visibleCourses(){return courses.filter(c=> isGlobal() ? true : c.id === profile?.courseId);}
   function byId(arr,id){return arr.find(x=>x.id===id)}
   function courseName(id){return byId(courses,id)?.name || 'Sin campo'}
@@ -176,12 +192,37 @@
 
   onAuthStateChanged(auth, async user=>{
     currentUser=user;
-    if(!user){$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden');return;}
-    const snap = await getDoc(doc(db,'users',user.uid));
-    if(!snap.exists()){ await bootstrapProfile(user); }
-    await loadAll();
-    $('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');
-    renderAll();
+    if(!user){
+      $('#loginView').classList.remove('hidden');
+      $('#appView').classList.add('hidden');
+      return;
+    }
+    try{
+      $('#loginView').classList.add('hidden');
+      $('#appView').classList.add('hidden');
+      const snap = await getDoc(doc(db,'users',user.uid));
+      if(!snap.exists()){ await bootstrapProfile(user); }
+      await loadAll();
+      if(profile?.active === false){
+        await signOut(auth);
+        toast('Este usuario está inactivo. Contacta al administrador global.');
+        return;
+      }
+      $('#loginView').classList.add('hidden');
+      $('#appView').classList.remove('hidden');
+      renderAll();
+      goPage('dashboard');
+    }catch(err){
+      console.error('Error al cargar Golf Flow 1:', err);
+      $('#loginView').classList.remove('hidden');
+      $('#appView').classList.add('hidden');
+      const messages = {
+        'permission-denied':'No tienes permisos para leer la base de datos. Revisa las reglas de Firestore o el perfil del usuario.',
+        'unavailable':'Firebase no está disponible en este momento. Revisa conexión e intenta otra vez.'
+      };
+      toast(messages[err.code] || err.message || 'No se pudo cargar la aplicación.');
+      try{ await signOut(auth); }catch(e){}
+    }
   });
 
   async function bootstrapProfile(user){
@@ -189,8 +230,29 @@
     const first = usersSnap.empty;
     await setDoc(doc(db,'users',user.uid),{name:user.email.split('@')[0],email:user.email,role:first?'Administrador Global':'Solo lectura',courseId:'',phone:'',photo:'',active:true,createdAt:serverTimestamp(),bootstrap:true});
   }
-  async function ensureRoles(){ const snap=await getDocs(collection(db,'roles')); if(snap.empty){ for(const r of defaultRoles) await addDoc(collection(db,'roles'),{...r,createdAt:serverTimestamp()}); } }
-  async function loadAll(){ await ensureRoles(); const [pSnap,cSnap,uSnap,rSnap] = await Promise.all([getDoc(doc(db,'users',currentUser.uid)),getDocs(collection(db,'golfCourses')),getDocs(collection(db,'users')),getDocs(collection(db,'roles'))]); profile={id:pSnap.id,...pSnap.data()}; courses=cSnap.docs.map(d=>({id:d.id,...d.data()})); users=uSnap.docs.map(d=>({id:d.id,...d.data()})); roles=rSnap.docs.map(d=>({id:d.id,...d.data()})); }
+  async function ensureRoles(){
+    try{
+      const snap=await getDocs(collection(db,'roles'));
+      if(snap.empty && isGlobal()){
+        for(const r of defaultRoles) await addDoc(collection(db,'roles'),{...r,createdAt:serverTimestamp()});
+      }
+    }catch(err){
+      console.warn('No se pudieron sincronizar roles; se usarán roles locales.', err);
+    }
+  }
+  async function loadAll(){
+    const [pSnap,cSnap,uSnap,rSnap] = await Promise.all([
+      getDoc(doc(db,'users',currentUser.uid)),
+      getDocs(collection(db,'golfCourses')),
+      getDocs(collection(db,'users')),
+      getDocs(collection(db,'roles')).catch(err=>({docs:[], empty:true, error:err}))
+    ]);
+    profile={id:pSnap.id,...pSnap.data(),role:normRole(pSnap.data()?.role)};
+    await ensureRoles();
+    courses=cSnap.docs.map(d=>({id:d.id,...d.data()}));
+    users=uSnap.docs.map(d=>({id:d.id,...d.data(),role:normRole(d.data().role)}));
+    roles=rSnap.docs.length ? rSnap.docs.map(d=>({id:d.id,...d.data(),name:normRole(d.data().name)})) : defaultRoles.map((r,i)=>({id:'local_'+i,...r}));
+  }
   function renderAll(){ renderHeader(); renderDashboard(); renderCourses(); renderUsers(); renderRoles(); }
   function renderHeader(){
     $('#sideName').textContent=profile.name||profile.email||'Usuario';
@@ -222,7 +284,7 @@
   window.removeCourse=async id=>{ if(!can('courses.delete')) return toast('No tienes permiso para borrar campos'); const c=byId(courses,id); if(!confirm(`¿Eliminar el campo ${c.name}?\n\nEsta acción eliminará la ficha del campo. Los usuarios asociados no se eliminan automáticamente.`))return; await deleteDoc(doc(db,'golfCourses',id)); await loadAll(); renderAll(); toast('Campo eliminado'); }
 
   $('#newUserBtn').onclick=()=>editUser();
-  window.editUser=(id='')=>{ const u=id?byId(users,id):{}; if(id && !canEditTargetUser(u)) return toast('No tienes permiso para editar este usuario'); const courseOptions=visibleCourses().map(c=>`<option value="${c.id}" ${u.courseId===c.id?'selected':''}>${c.name}</option>`).join(''); const roleOptions=roles.filter(r=>isGlobal()||r.name!=='Administrador Global').map(r=>`<option ${u.role===r.name?'selected':''}>${r.name}</option>`).join(''); openModal(id?'Editar Usuario':'Nuevo Usuario','Password solo se usa al crear usuario. Para usuarios existentes usa restablecer password.',`
+  window.editUser=(id='')=>{ const u=id?byId(users,id):{}; if(id && !canEditTargetUser(u)) return toast('No tienes permiso para editar este usuario'); const courseOptions=visibleCourses().map(c=>`<option value="${c.id}" ${u.courseId===c.id?'selected':''}>${c.name}</option>`).join(''); const roleOptions=roles.filter(r=>isGlobal()||normRole(r.name)!=='Administrador Global').map(r=>`<option ${normRole(u.role)===normRole(r.name)?'selected':''}>${normRole(r.name)}</option>`).join(''); openModal(id?'Editar Usuario':'Nuevo Usuario','Password solo se usa al crear usuario. Para usuarios existentes usa restablecer password.',`
     <form id="userForm"><div class="grid two"><div class="field"><label>Nombre completo</label><input name="name" required value="${u.name||''}"></div><div class="field"><label>Email</label><input name="email" type="email" required ${id?'readonly':''} value="${u.email||''}"></div><div class="field"><label>Password ${id?'(no editable aquí)':''}</label><input name="password" type="password" ${id?'placeholder="Usa restablecer password" disabled':'required placeholder="Mínimo 6 caracteres"'}></div><div class="field"><label>Teléfono</label><input name="phone" value="${u.phone||''}"></div><div class="field"><label>Campo asignado</label><select name="courseId"><option value="">Sin campo</option>${courseOptions}</select></div><div class="field"><label>Rol</label><select name="role">${roleOptions}</select></div></div><div class="field"><label>Foto del usuario</label><input name="photo" type="file" accept="image/*"></div><div class="field"><label>Estado</label><select name="active"><option value="true" ${u.active!==false?'selected':''}>Activo</option><option value="false" ${u.active===false?'selected':''}>Inactivo</option></select></div><button class="btn primary full">Guardar usuario</button></form>`); $('#userForm').onsubmit=async e=>{e.preventDefault(); const f=e.target; const photo=await fileToDataUrl(f.photo.files[0]); const data={name:f.name.value,email:f.email.value,phone:f.phone.value,courseId:f.courseId.value,role:f.role.value,active:f.active.value==='true',updatedAt:serverTimestamp()}; if(photo)data.photo=photo; if(id){ await updateDoc(doc(db,'users',id),data); } else { const secondary=initializeApp(firebaseConfig,'Secondary'+Date.now()); const secondaryAuth=getAuth(secondary); const cred=await createUserWithEmailAndPassword(secondaryAuth,f.email.value,f.password.value); await setDoc(doc(db,'users',cred.user.uid),{...data,createdAt:serverTimestamp()}); await signOut(secondaryAuth); await deleteApp(secondary); } closeModal(); await loadAll(); renderAll(); toast('Usuario guardado');}; }
   window.resetPassword=async email=>{ if(!email)return; await sendPasswordResetEmail(auth,email); toast('Correo de restablecimiento enviado'); }
   window.removeUser=async id=>{ const u=byId(users,id); if(!canDeleteTargetUser(u)) return toast('No tienes permiso para borrar este usuario'); if(!confirm(`¿Eliminar usuario ${u.name}?\n\nSe eliminará su perfil de Firestore. Para borrarlo de Authentication permanentemente se requiere Cloud Function/Admin SDK.`))return; await deleteDoc(doc(db,'users',id)); await loadAll(); renderAll(); toast('Usuario eliminado de Firestore'); }
